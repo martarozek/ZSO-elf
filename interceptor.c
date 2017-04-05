@@ -5,15 +5,16 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
+#include <sys/auxv.h>
 
 #include "interceptor.h"
 
-#define Elf_Phdr  Elf64_Phdr
-#define Elf_Dyn   Elf64_Dyn
-#define Elf_Rela  Elf64_Rela
 #define Elf_Addr  Elf64_Addr
-#define Elf_Xword Elf64_Xword
+#define Elf_Dyn   Elf64_Dyn
+#define Elf_Phdr  Elf64_Phdr
+#define Elf_Rela  Elf64_Rela
 #define Elf_Sym   Elf64_Sym
+#define Elf_Xword Elf64_Xword
 
 typedef void *ifunc(void);
 
@@ -29,9 +30,12 @@ const char *get_sym_name(const Elf_Sym *sym, const char *strtab_base) {
 static int find_symbol(struct dl_phdr_info *info, size_t size, void *data) {
     Elf_Sym *symtab_base;
     char *strtab_base;
-    bool vdso = true;
-
     Elf_Phdr *phdr = (Elf_Phdr *) info->dlpi_phdr;
+
+    Elf64_Ehdr *vdso = (Elf64_Ehdr *) getauxval(AT_SYSINFO_EHDR);
+    if ((Elf_Addr) info->dlpi_phdr == (Elf_Addr) vdso->e_phoff + (Elf_Addr) vdso) {
+        return 0;
+    }
 
     for (int i = 0; i < info->dlpi_phnum; ++i) {
         if (phdr[i].p_type == PT_DYNAMIC) {
@@ -43,9 +47,6 @@ static int find_symbol(struct dl_phdr_info *info, size_t size, void *data) {
                 else if (dyn_entry[j].d_tag == DT_SYMTAB) {
                     symtab_base = (Elf_Sym *) dyn_entry[j].d_un.d_ptr;
                 }
-                else if (dyn_entry[j].d_tag == DT_JMPREL) {
-                    vdso = false;
-                }
             }
             break;
         }
@@ -53,22 +54,21 @@ static int find_symbol(struct dl_phdr_info *info, size_t size, void *data) {
 
     Intercept_Data *intercept_data = (Intercept_Data *) data;
 
-    if (!vdso) {
-        Elf_Sym *sym = symtab_base;
-        while ((Elf_Addr) sym < (Elf_Addr) strtab_base) {
-            if (strcmp(get_sym_name(sym, strtab_base), intercept_data->func_name) == 0) {
-                if (sym->st_shndx != SHN_UNDEF) {
-                    if (ELF64_ST_TYPE(sym->st_info) == STT_GNU_IFUNC) {
-                        intercept_data->func_ptr = ((ifunc *) (info->dlpi_addr + sym->st_value))();
-                    } else {
-                        intercept_data->func_ptr = (void *) (info->dlpi_addr + sym->st_value);
-                    }
-                    return 1;
+    Elf_Sym *sym = symtab_base;
+    while ((Elf_Addr) sym < (Elf_Addr) strtab_base) {
+        if (strcmp(get_sym_name(sym, strtab_base), intercept_data->func_name) == 0) {
+            if (sym->st_shndx != SHN_UNDEF) {
+                if (ELF64_ST_TYPE(sym->st_info) == STT_GNU_IFUNC) {
+                    intercept_data->func_ptr = ((ifunc *) (info->dlpi_addr + sym->st_value))();
+                } else {
+                    intercept_data->func_ptr = (void *) (info->dlpi_addr + sym->st_value);
                 }
+                return 1;
             }
-            ++sym;
         }
+        ++sym;
     }
+
 
     return 0;
 }
@@ -128,15 +128,22 @@ static int replace_function(struct dl_phdr_info *info, size_t size, void *data) 
 }
 
 void *intercept_function(const char *name, void *new_func) {
-    Intercept_Data data = { .func_name = name, .func_ptr = new_func };
-    dl_iterate_phdr(replace_function, (void *) &data);
-    data.func_ptr = NULL;
+    Intercept_Data data = { .func_name = name, .func_ptr = NULL };
     dl_iterate_phdr(find_symbol, (void *) &data);
-    return data.func_ptr;
+    if (data.func_ptr == NULL) {
+        return NULL;
+    }
+    void *func_ptr = data.func_ptr;
+    data.func_ptr = new_func;
+    dl_iterate_phdr(replace_function, (void *) &data);
+    return func_ptr;
 }
 
 void unintercept_function(const char *name) {
     Intercept_Data data = { .func_name = name, .func_ptr = NULL };
     dl_iterate_phdr(find_symbol, (void *) &data);
+    if (data.func_ptr == NULL) {
+        return;
+    }
     dl_iterate_phdr(replace_function, (void *) &data);
 }

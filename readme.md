@@ -4,7 +4,7 @@ Marta Rożek
 
 Szukanie funkcji w tablicach symboli:
 - żeby poznać rozmiar symtab zakładam, że po symtab występuje strtab; dzięki temu iteruję po symtab i pomijam temat haszowania;
-- aby uniknąć problemu z vdso zakładam, że vdso nie ma relokacji i tylko po tym go rozpoznaję;
+- aby uniknąć problemu z vdso sprawdzam czy adres obiektu zgadza się z adresem zwróconym przez getauxval(AT_SYSINFO_EHDR);
 - pomijam symbole oznaczone SHN_UNDEF;
 - symbole oznaczone STT_GNU_IFUNC rezolwuję;
 
