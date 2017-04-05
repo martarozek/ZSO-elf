@@ -1,13 +1,10 @@
 #define _GNU_SOURCE
 
 #include <link.h>
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-#include <stdbool.h>
 #include <sys/auxv.h>
-
-#include "interceptor.h"
 
 #define Elf_Addr  Elf64_Addr
 #define Elf_Dyn   Elf64_Dyn
@@ -18,13 +15,34 @@
 
 typedef void *ifunc(void);
 
-typedef struct Intercept_Data{
+typedef struct Intercept_Data {
     const char *func_name;
     void *func_ptr;
 } Intercept_Data;
 
-const char *get_sym_name(const Elf_Sym *sym, const char *strtab_base) {
-    return strtab_base + sym->st_name;
+static int find_symbol(struct dl_phdr_info *info, size_t size, void *data);
+static int replace_function(struct dl_phdr_info *info, size_t size, void *data);
+const char *get_sym_name(const Elf_Sym *sym, const char *strtab_base);
+
+void *intercept_function(const char *name, void *new_func) {
+    Intercept_Data data = { .func_name = name, .func_ptr = NULL };
+    dl_iterate_phdr(find_symbol, (void *) &data);
+    if (data.func_ptr == NULL) {
+        return NULL;
+    }
+    void *func_ptr = data.func_ptr;
+    data.func_ptr = new_func;
+    dl_iterate_phdr(replace_function, (void *) &data);
+    return func_ptr;
+}
+
+void unintercept_function(const char *name) {
+    Intercept_Data data = { .func_name = name, .func_ptr = NULL };
+    dl_iterate_phdr(find_symbol, (void *) &data);
+    if (data.func_ptr == NULL) {
+        return;
+    }
+    dl_iterate_phdr(replace_function, (void *) &data);
 }
 
 static int find_symbol(struct dl_phdr_info *info, size_t size, void *data) {
@@ -40,6 +58,7 @@ static int find_symbol(struct dl_phdr_info *info, size_t size, void *data) {
     for (int i = 0; i < info->dlpi_phnum; ++i) {
         if (phdr[i].p_type == PT_DYNAMIC) {
             Elf_Dyn *dyn_entry = (Elf_Dyn *) (info->dlpi_addr + phdr[i].p_vaddr);
+
             for (int j = 0; dyn_entry[j].d_tag != DT_NULL; ++j) {
                 if (dyn_entry[j].d_tag == DT_STRTAB) {
                     strtab_base = (char *) dyn_entry[j].d_un.d_ptr;
@@ -58,6 +77,7 @@ static int find_symbol(struct dl_phdr_info *info, size_t size, void *data) {
     while ((Elf_Addr) sym < (Elf_Addr) strtab_base) {
         if (strcmp(get_sym_name(sym, strtab_base), intercept_data->func_name) == 0) {
             if (sym->st_shndx != SHN_UNDEF) {
+
                 if (ELF64_ST_TYPE(sym->st_info) == STT_GNU_IFUNC) {
                     intercept_data->func_ptr = ((ifunc *) (info->dlpi_addr + sym->st_value))();
                 } else {
@@ -83,21 +103,22 @@ static int replace_function(struct dl_phdr_info *info, size_t size, void *data) 
 
     for (int i = 0; i < info->dlpi_phnum; ++i) {
         if (phdr[i].p_type == PT_DYNAMIC) {
-            Elf_Dyn *dyn = (Elf_Dyn *) (info->dlpi_addr + phdr[i].p_vaddr);
+            Elf_Dyn *dyn = (Elf_Dyn *)(info->dlpi_addr + phdr[i].p_vaddr);
+
             for (int j = 0; dyn[j].d_tag != DT_NULL; ++j) {
                 if (dyn[j].d_tag == DT_PLTRELSZ) {
                     plt_sz = (Elf_Xword) dyn[j].d_un.d_val;
-                }
-                else if (dyn[j].d_tag == DT_RELAENT) {
+
+                } else if (dyn[j].d_tag == DT_RELAENT) {
                     plt_ent_sz = (Elf_Xword) dyn[j].d_un.d_val;
-                }
-                else if (dyn[j].d_tag == DT_JMPREL) {
+
+                } else if (dyn[j].d_tag == DT_JMPREL) {
                     plt_base = (Elf_Rela *) dyn[j].d_un.d_ptr;
-                }
-                else if (dyn[j].d_tag == DT_STRTAB) {
+
+                } else if (dyn[j].d_tag == DT_STRTAB) {
                     strtab_base = (char *) dyn[j].d_un.d_ptr;
-                }
-                else if (dyn[j].d_tag == DT_SYMTAB) {
+
+                } else if (dyn[j].d_tag == DT_SYMTAB) {
                     symtab_base = (Elf_Sym *) dyn[j].d_un.d_ptr;
                 }
             }
@@ -114,11 +135,13 @@ static int replace_function(struct dl_phdr_info *info, size_t size, void *data) 
 
     for (int i = 0; i < plt_ent_cnt; ++i) {
         Elf_Rela *plt_entry = plt_base + i;
+
         if (ELF64_R_TYPE(plt_entry->r_info) == R_X86_64_JUMP_SLOT) {
             Elf_Sym *sym = symtab_base + ELF64_R_SYM(plt_entry->r_info);
+
             if (strcmp(get_sym_name(sym, strtab_base), intercept_data->func_name) == 0) {
                 Elf_Addr got = info->dlpi_addr + plt_entry->r_offset;
-                *(void**) got = intercept_data->func_ptr;
+                *(void **) got = intercept_data->func_ptr;
                 break;
             }
         }
@@ -127,23 +150,6 @@ static int replace_function(struct dl_phdr_info *info, size_t size, void *data) 
     return 0;
 }
 
-void *intercept_function(const char *name, void *new_func) {
-    Intercept_Data data = { .func_name = name, .func_ptr = NULL };
-    dl_iterate_phdr(find_symbol, (void *) &data);
-    if (data.func_ptr == NULL) {
-        return NULL;
-    }
-    void *func_ptr = data.func_ptr;
-    data.func_ptr = new_func;
-    dl_iterate_phdr(replace_function, (void *) &data);
-    return func_ptr;
-}
-
-void unintercept_function(const char *name) {
-    Intercept_Data data = { .func_name = name, .func_ptr = NULL };
-    dl_iterate_phdr(find_symbol, (void *) &data);
-    if (data.func_ptr == NULL) {
-        return;
-    }
-    dl_iterate_phdr(replace_function, (void *) &data);
+const char *get_sym_name(const Elf_Sym *sym, const char *strtab_base) {
+    return strtab_base + sym->st_name;
 }
